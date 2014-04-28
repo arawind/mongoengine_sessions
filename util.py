@@ -5,8 +5,9 @@ import sys
 from hashlib import sha256
 from functools import partial
 from pyramid.settings import asbool
-from redis.exceptions import WatchError
 from pyramid.exceptions import ConfigurationError
+
+import datetime
 
 PY3 = sys.version_info[0] == 3
 
@@ -39,15 +40,13 @@ def prefixed_id(prefix='session:'):
     session_id = _generate_session_id()
     prefixed_id = prefix + session_id
     return prefixed_id
-
+""" 
 def _insert_session_id_if_unique(
-    redis,
     timeout,
-    session_id,
-    serialize,
+    session_id
     ):
-    """ Attempt to insert a given ``session_id`` and return the succesful id or
-    ``None``."""
+    Attempt to insert a given ``session_id`` and return the succesful id or
+    ``None``.
     with redis.pipeline() as pipe:
         try:
             pipe.watch(session_id)
@@ -62,33 +61,31 @@ def _insert_session_id_if_unique(
             return session_id
         except WatchError:
             return None
-
+"""
 def get_unique_session_id(
-    redis,
     timeout,
-    serialize,
     generator=_generate_session_id,
     ):
     """
-    Returns a unique session id after inserting it successfully in Redis.
-    """
+    Returns a unique session id after inserting it successfully in Mongo.
+
     while 1:
         session_id = generator()
-        attempt = _insert_session_id_if_unique(
-            redis,
-            timeout,
-            session_id,
-            serialize,
-            )
-        if attempt is not None:
-            return attempt
-
+        attempt = MongoEngineSession(
+        session_id,
+        {},
+        timeout)
+        attempt.save()
+        if attempt.session_id == session_id:
+            return session_id
+    """
+    return generator()
 def _parse_settings(settings):
     """
-    Convenience function to collect settings prefixed by 'redis.sessions' and
+    Convenience function to collect settings prefixed by 'mongoengine_session' and
     coerce settings to ``int``, ``float``, and ``bool`` as needed.
     """
-    keys = [s for s in settings if s.startswith('redis.sessions.')]
+    keys = [s for s in settings if s.startswith('mongoengine_sessions.')]
 
     options = {}
 
@@ -99,7 +96,7 @@ def _parse_settings(settings):
 
     # only required setting
     if 'secret' not in options:
-        raise ConfigurationError('redis.sessions.secret is a required setting')
+        raise ConfigurationError('mongoengine_sessions.secret is a required setting')
 
     # coerce bools
     for b in ('cookie_secure', 'cookie_httponly', 'cookie_on_exception'):
@@ -129,26 +126,25 @@ def _parse_settings(settings):
 
 def refresh(wrapped):
     """
-    Decorator to reset the expire time for this session's key in Redis.
+    Decorator to reset the expire time for this session's key in mongoengine_session.
     """
     def wrapped_refresh(session, *arg, **kw):
         result = wrapped(session, *arg, **kw)
-        session.redis.expire(session.session_id, session.timeout)
+        session.expires = datetime.datetime.now() + datetime.timedelta(seconds=session.timeout)
+        session.save()
         return result
 
     return wrapped_refresh
 
 def persist(wrapped):
     """
-    Decorator to persist the working session copy in Redis and reset the
-    expire time.
+    Decorator to persist the working session copy in mongo and reset the
+    expire time. Same as refresh, no difference in mongoengine_session
     """
     def wrapped_persist(session, *arg, **kw):
         result = wrapped(session, *arg, **kw)
-        with session.redis.pipeline() as pipe:
-            pipe.set(session.session_id, session.to_redis())
-            pipe.expire(session.session_id, session.timeout)
-            pipe.execute()
+        session.expires = datetime.datetime.now() + datetime.timedelta(seconds=session.timeout)
+        session.save()
         return result
 
     return wrapped_persist

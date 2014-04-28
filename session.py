@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 
 import os
-import time
+import datetime
 
 
 import binascii
 from pyramid.compat import text_
 from zope.interface import implementer
+
+from mongoengine.document import Document
+from mongoengine.fields import StringField, DictField, DateTimeField, IntField
 
 from .compat import cPickle
 
@@ -18,85 +21,66 @@ from .util import (
 
 from pyramid.interfaces import ISession
 
+class SessionDocument(Document):
+    session_id = StringField(primary_key=True)
+    expires = DateTimeField()
+    managed_dict = DictField()
+    default_timeout = IntField()
+
 @implementer(ISession)
-class RedisSession(object):
+class MongoEngineSession(object):
     """
     Implements the Pyramid ISession and IDict interfaces and is returned by
-    the ``RedisSessionFactory``.
+    the ``MongoEngineSessionFactory``.
 
     Methods that modify the ``dict`` (get, set, update, etc.) are decorated
-    with ``@persist`` to update the persisted copy in Redis and reset the
+    with ``@persist`` to update the persisted copy in Mongo and reset the
     timeout.
 
     Methods that are read-only (items, keys, values, etc.) are decorated
-    with ``@refresh`` to reset the session's expire time in Redis.
-
-    Session methods make use of the dict methods that already communicate with
-    Redis, so they are not decorated.
+    with ``@refresh`` to reset the session's expire time in Mongo. Same as @persist
 
     Parameters:
-
-    ``redis``
-    A Redis connection object.
 
     ``session_id``
     A unique string associated with the session. Used as a prefix for keys
     and hashes associated with the session.
 
-    ``timeout``
-    Keys will be set to expire in ``timeout`` seconds on each read/write
-    access. If keys are not accessed for the duration of a ``timeout``,
-    Redis will remove them.
+    ``managed_dict``
+    The dictionary to be loaded into the current session
+    
+    ``expires``
+    The time after which a background service in python should remove the session entry
+    The process has to be scheduled and written by the user, not provided in this package
 
     ``delete_cookie``
     A function that takes no arguments and returns nothing, but should have the
     side effect of deleting the session cookie from the ``response`` object.
-
-    ``serialize``
-    A function to serialize pickleable Python objects. Default:
-    ``cPickle.dumps``.
-
-    ``deserialize``
-    The dual of ``serialize``, to convert serialized strings back to Python
-    objects. Default: ``cPickle.loads``.
     """
-
+    
     def __init__(
         self,
-        redis,
         session_id,
-        timeout,
-        delete_cookie,
-        serialize=cPickle.dumps,
-        deserialize=cPickle.loads
+        managed_dict,
+        expires,
+        default_timeout,
+        delete_cookie
         ):
-
-        self.session_id = session_id
-        self.redis = redis
-        self.serialize = serialize
-        self.deserialize = deserialize
+            
+        
+        self.session_id = session_id       
+        
         self.delete_cookie = delete_cookie
-        self.created = time.time()
-        self.managed_dict = self.from_redis()
-        self.default_timeout = timeout
+        self.expires = expires
+        self.managed_dict = managed_dict
+        self.default_timeout = default_timeout
+
+#TODO Remove serialize and deserialize operations
 
     @property
     def timeout(self):
         return self.managed_dict.get('_rs_timeout', self.default_timeout)
-
-    def to_redis(self):
-        """ Serialize this session's ``managed_dict`` for storage in Redis.
-        Primarily used by the ``@persist`` decorator to save the current session
-        state to Redis.
-        """
-        return self.serialize(self.managed_dict)
-
-    def from_redis(self):
-        """ Get this session's pickled/serialized ``dict`` from Redis."""
-        persisted = self.redis.get(self.session_id)
-        deserialized = self.deserialize(persisted)
-        return deserialized
-
+    
     # dict modifying methods decorated with @persist
     @persist
     def __delitem__(self, key):
@@ -196,7 +180,7 @@ class RedisSession(object):
     def invalidate(self):
         """ Delete all keys unique to this session and expire cookie."""
         self.clear()
-        self.redis.delete(self.session_id)
+        self.delete()
         self.delete_cookie()
 
     def new_csrf_token(self):
@@ -216,7 +200,7 @@ class RedisSession(object):
         storage = self.setdefault('_f_' + queue, [])
         if allow_duplicate or (msg not in storage):
             storage.append(msg)
-            self.changed()  # notify redis of change to ``storage`` mutable
+            self.changed()  # notify mongoengine of change to ``storage`` mutable
 
     def peek_flash(self, queue=''):
         storage = self.get('_f_' + queue, [])
@@ -226,7 +210,6 @@ class RedisSession(object):
         storage = self.pop('_f_' + queue, [])
         return storage
 
-    # RedisSession extra methods
     def adjust_timeout_for_session(self, timeout_seconds):
         """
         Permanently adjusts the timeout for this session to ``timeout_seconds``
@@ -234,3 +217,13 @@ class RedisSession(object):
         want to change the expire time for a session dynamically.
         """
         self['_rs_timeout'] = timeout_seconds
+        
+    def save(self):
+        sessionDoc = SessionDocument(
+            session_id=self.session_id,
+            expires=self.expires,
+            managed_dict=dict(self.managed_dict),
+            default_timeout=self.default_timeout
+        )
+        
+        sessionDoc.save()
